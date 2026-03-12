@@ -1,108 +1,255 @@
 import numpy as np
-import matplotlib.pyplot as plt
+import pkgutil
+import importlib
+import inspect
 import ipywidgets as widgets
+import matplotlib.pyplot as plt
 from IPython.display import display
 
 
+# Optional dependencies
+try:
+    import bct
+    BCT_AVAILABLE = True
+except ImportError:
+    BCT_AVAILABLE = False
+
+try:
+    import tvb.analyzers as analyzers
+    from tvb.datatypes.time_series import TimeSeries
+    TVB_AVAILABLE = True
+except ImportError:
+    TVB_AVAILABLE = False
+
+
+
+# Discover TVB metrics dynamically
+def discover_tvb_metrics():
+
+    metrics = {}
+
+    if not TVB_AVAILABLE:
+        return metrics
+
+    for _, module_name, _ in pkgutil.iter_modules(analyzers.__path__):
+
+        if not module_name.startswith("metric_"):
+            continue
+
+        module = importlib.import_module(f"tvb.analyzers.{module_name}")
+
+        for name, obj in inspect.getmembers(module):
+
+            if inspect.isfunction(obj) and name.startswith("compute_"):
+                label = name.replace("compute_", "").replace("_metric", "")
+                label = label.replace("_", " ").title()
+
+                metrics[f"TVB: {label}"] = obj
+
+    return metrics
+
+
+
+# Discover BCT metrics dynamically
+def discover_bct_metrics():
+
+    metrics = {}
+
+    if not BCT_AVAILABLE:
+        return metrics
+
+    test = np.random.rand(10,10)
+    test = (test + test.T)/2
+
+    for name, fn in inspect.getmembers(bct, inspect.isfunction):
+        try:
+            result = fn(test)
+
+            if isinstance(result, np.ndarray) and result.shape == (10,):
+                label = name.replace("_"," ").title()
+                metrics[f"BCT: {label}"] = fn
+
+        except Exception:
+            continue
+
+    return metrics
+
+
+
+# Unified metric registry
+METRICS = {}
+METRICS.update(discover_tvb_metrics())
+METRICS.update(discover_bct_metrics())
+
+
+
+# Helper functions
 def make_fake_timeseries():
-    """Creates fake brain signal data."""
+
     np.random.seed(42)
-    return np.random.randn(500, 10)   # 500 timepoints, 10 regions
+    return np.random.randn(600, 10)
 
 
-def make_fake_region_positions():
-    """Creates (x, y) positions for 10 brain regions on a 2D plot."""
-    angles = np.linspace(0, 2 * np.pi, 10, endpoint=False)
-    x = np.cos(angles)
-    y = np.sin(angles)
-    return x, y
+def make_region_positions(n):
+
+    angles = np.linspace(0, 2*np.pi, n, endpoint=False)
+
+    return np.column_stack([
+        np.cos(angles),
+        np.sin(angles)
+    ])
 
 
-REGION_NAMES = [
-    "Frontal-L", "Frontal-R", "Parietal-L", "Parietal-R",
-    "Temporal-L", "Temporal-R", "Occipital-L", "Occipital-R",
-    "Cingulate-L", "Cingulate-R"
-]
+def wrap_timeseries(data):
+
+    if isinstance(data, TimeSeries):
+        return data
+
+    # duplicate signal to create two state variables
+    data2 = np.stack([data, data], axis=1)
+
+    ts = TimeSeries(
+        data=data2[:, :, :, None],
+        sample_period=1.0
+    )
+
+    ts.configure()
+
+    return ts
 
 
-def compute_metric(timeseries, metric_name):
+
+# Compute metric
+def call_tvb_metric(fn, ts):
     """
-    Takes the timeseries (time x regions) and computes
-    ONE number per region — that number is what gets colored.
-    metric_name options:
-      "Mean"     → average signal per region
-      "Variance" → how much the signal fluctuates per region
+    Try to call a TVB metric without hardcoding parameter names.
+    Add required parameters only when the function raises KeyError.
     """
-    if metric_name == "Mean":
-        return np.mean(timeseries, axis=0)      # shape: (10,)
 
-    if metric_name == "Variance":
-        return np.var(timeseries, axis=0)       # shape: (10,)
+    params = {"time_series": ts}
 
+    # possible optional parameters with defaults
+    defaults = {
+        "start_point": 500,
+        "segment": 4,
+    }
 
-def draw_plot(metric_name, colormap):
-    """
-    Draws the actual visualization:
-    - Left plot: brain regions as colored dots
-    - Right plot: histogram of metric values across regions
-    """
-    ts       = make_fake_timeseries()
-    x, y     = make_fake_region_positions()
-    values   = compute_metric(ts, metric_name)   # one number per region
+    for key, value in defaults.items():
+        try:
+            return fn(params)
+        except KeyError as e:
+            missing = str(e).strip("'")
+            if missing in defaults:
+                params[missing] = defaults[missing]
+            else:
+                raise
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    return fn(params)
 
-    # ── Left: brain map ──
-    scatter = ax1.scatter(x, y, c=values, cmap=colormap, s=300, zorder=3)
+def compute_metric(data, metric_name):
 
-    # label each dot with the region name
-    for i, name in enumerate(REGION_NAMES):
-        ax1.annotate(name, (x[i], y[i]), fontsize=7,
-                     ha="center", va="bottom", xytext=(0, 12),
-                     textcoords="offset points")
+    fn = METRICS[metric_name]
 
-    fig.colorbar(scatter, ax=ax1, label=metric_name)
-    ax1.set_title(f"Brain Regions colored by {metric_name}")
+    if metric_name.startswith("TVB"):
+
+        ts = wrap_timeseries(data)
+
+        result = call_tvb_metric(fn, ts)
+
+        # handle dict outputs
+        if isinstance(result, dict):
+            result = list(result.values())[0]
+
+        values = np.array(result)
+
+        if values.size == 1:
+            values = np.repeat(values, data.shape[1])
+
+        return values
+
+    else:
+
+        fc = np.abs(np.corrcoef(data.T))
+        return fn(fc)
+
+# Plot
+def draw_plot(data, metric_name, cmap):
+
+    values = compute_metric(data, metric_name)
+
+    n = len(values)
+
+    coords = make_region_positions(n)
+
+    fig, (ax1, ax2) = plt.subplots(1,2,figsize=(10,4))
+
+    scatter = ax1.scatter(
+        coords[:,0],
+        coords[:,1],
+        c=values,
+        cmap=cmap,
+        s=200
+    )
+
+    ax1.set_title(metric_name)
     ax1.set_xticks([])
     ax1.set_yticks([])
 
-    # ── Right: histogram ──
-    ax2.hist(values, bins=5, color="steelblue", edgecolor="white")
-    ax2.set_xlabel(metric_name)
-    ax2.set_ylabel("Number of regions")
-    ax2.set_title(f"Distribution of {metric_name}")
+    fig.colorbar(scatter, ax=ax1)
+
+    ax2.hist(values, bins=6)
+
+    ax2.set_title("Distribution")
 
     plt.tight_layout()
     plt.show()
 
-def show_widget():
-    metric_dropdown = widgets.Dropdown(
-        options=["Mean", "Variance"],
-        value="Mean",
-        description="Metric:",
-    )
-    colormap_dropdown = widgets.Dropdown(
-        options=["viridis"],
-        value="viridis",
-        description="Colormap:",
-    )
 
-    output = widgets.Output()   # a box that holds the plot
 
-    def on_change(change):
-        """Runs every time a dropdown value changes — clears old plot, draws new one."""
-        with output:
-            output.clear_output(wait=True)
-            draw_plot(metric_dropdown.value, colormap_dropdown.value)
+# Widget
+class MetricsProjectionWidget:
 
-    # attach on_change to both dropdowns
-    metric_dropdown.observe(on_change, names="value")
-    colormap_dropdown.observe(on_change, names="value")
+    def __init__(self, data=None):
 
-    # show everything
-    display(widgets.HBox([metric_dropdown, colormap_dropdown]))
-    display(output)
+        if data is None:
+            data = make_fake_timeseries()
 
-    # draw the first plot immediately
-    with output:
-        draw_plot(metric_dropdown.value, colormap_dropdown.value)
+        self.data = data
+
+        self.metric_dd = widgets.Dropdown(
+            options=list(METRICS.keys()),
+            description="Metric:"
+        )
+
+        self.cmap_dd = widgets.Dropdown(
+            options=["viridis","plasma"],
+            value="viridis",
+            description="Colormap:"
+        )
+
+        self.output = widgets.Output()
+
+        self.metric_dd.observe(self.update, names="value")
+        self.cmap_dd.observe(self.update, names="value")
+
+    def update(self, change=None):
+
+        with self.output:
+            self.output.clear_output(wait=True)
+
+            draw_plot(
+                self.data,
+                self.metric_dd.value,
+                self.cmap_dd.value
+            )
+
+    def show(self):
+
+        display(
+            widgets.VBox([
+                widgets.HBox([self.metric_dd, self.cmap_dd]),
+                self.output
+            ])
+        )
+
+        self.update()
